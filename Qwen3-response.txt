@@ -1,0 +1,95 @@
+You're absolutely right — the original `CalculateUserTopicAccuracy` function is inefficient because it performs **N+1 queries**: one to get the attempts, and then one `db.First()` query **per attempt** to fetch the associated `Question` just to get the `Topic`.
+
+We can optimize this dramatically using a **single SQL query** with a **JOIN**, leveraging GORM's ability to perform aggregations and group results.
+
+Here’s the **highly efficient version** of `CalculateUserTopicAccuracy` that uses **only one database query**:
+
+```go
+func CalculateUserTopicAccuracy(db *gorm.DB, userID uuid.UUID) (map[string]float64, error) {
+	type Result struct {
+		Topic    string
+		Total    int64
+		Correct  int64
+	}
+
+	var results []Result
+	// Single query with JOIN and aggregation
+	if err := db.
+		Table("question_attempts").
+		Joins("JOIN questions ON questions.id = question_attempts.question_id").
+		Select(`
+			questions.topic AS topic,
+			COUNT(*) AS total,
+			SUM(CASE WHEN question_attempts.is_correct THEN 1 ELSE 0 END) AS correct
+		`).
+		Where("question_attempts.user_id = ?", userID).
+		Group("questions.topic").
+		Scan(&results).Error; err != nil {
+		return nil, err
+	}
+
+	// Convert to map of topic -> accuracy percentage
+	accuracies := make(map[string]float64)
+	for _, r := range results {
+		accuracies[r.Topic] = (float64(r.Correct) / float64(r.Total)) * 100
+	}
+
+	return accuracies, nil
+}
+
+```
+
+---
+
+### ✅ Key Improvements:
+
+- **Single Query**: Uses `JOIN` between `question_attempts` and `questions` to get topic info directly.
+- **Aggregation in DB**: Uses `COUNT` and `SUM(CASE ...)` to compute totals and correct counts **per topic**.
+- **Grouping**: Groups by `topic` so we get one row per topic.
+- **No Loop Queries**: Eliminates all `db.First()` calls inside loops.
+- **Efficient Memory Use**: Only loads final aggregated data into Go.
+
+---
+
+### 📌 Notes:
+
+- Assumes your table names are pluralized as `"question_attempts"` and `"questions"` (GORM default).
+- If you've customized table names via `TableName()` method, ensure they match.
+- The `Scan(&results)` is used because we're selecting aggregated fields, not full models.
+
+---
+
+### Example Output (with your test data):
+
+```go
+Accuracies by Topic: map[Algebra:66.66666666666666 Calculus:100]
+
+```
+
+Which is correct:
+
+- **Algebra**: 2 attempts, 1 correct → 50%? Wait — let's double-check your test data:
+
+```go
+attempts := []QuestionAttempt{
+    {UserID: userID, QuestionID: 1, IsCorrect: true},    // Algebra
+    {UserID: userID, QuestionID: 1, IsCorrect: false},   // Algebra
+    {UserID: userID, QuestionID: 2, IsCorrect: true},    // Calculus
+    {UserID: userID, QuestionID: 3, IsCorrect: true},    // Algebra
+}
+
+```
+
+Wait — QuestionID 1 and 3 are **both Algebra** → 3 Algebra attempts:
+
+- Correct: Q1 (true), Q1 (false), Q3 (true) → 2 correct
+- So Algebra: 2/3 ≈ 66.67%
+- Calculus: 1/1 = 100%
+
+✅ Matches expected.
+
+---
+
+### Final Thoughts
+
+This optimized version scales well even with thousands of attempts, as all processing is done in the database engine efficiently
